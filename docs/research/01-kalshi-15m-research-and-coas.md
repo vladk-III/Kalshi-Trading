@@ -23,7 +23,7 @@
 1. **You are predicting a 60-second average, not a spot price.** An average of a random walk has lower variance than the endpoint. For Brownian motion averaged over a window of length *w* ending at T, Var ≈ σ²(T − w) + σ²·w/3. Both the strike and the settlement value are averages.
 2. **The final 60 seconds are partly observed.** Inside the averaging window, part of the settlement value is already locked in. With 30 seconds left, half the average is known and the remaining uncertainty is about σ²·(30s)/3·(¼). This is the most mechanical, model-friendly edge in the product.
 3. **The strike is known once the window opens.** The question reduces to P(A_close ≥ K), where K is a known number and A_close is a 60-second average of a process you can watch live.
-4. **The BRTI is not "the BTC price."** It is a CF Benchmarks index built from an order-book-weighted median over several constituent USD spot exchanges. Real-time BRTI is a licensed feed. A proxy rebuilt from constituent exchange books (Coinbase, Kraken, Bitstamp, Gemini, etc. **[verify the constituent list]**) carries tracking error, and the size of that error decides how sharp your posterior can get.
+4. **The BRTI is not "the BTC price."** It is a CF Benchmarks index built from an order-book-weighted median over several constituent USD spot exchanges. **Kalshi streams the official index values itself.** The `cfbenchmarks_value` WebSocket channel (about 1 Hz, 21 coins including BRTI, ETHUSD_RTI, SOLUSD_RTI, XRPUSD_RTI) includes a trailing 60-second average and, in the final minute of each quarter hour, the **running settlement average** (`last_60s_windowed_average_15min`). The `cfbenchmarks_value_5hz` channel covers BTC/ETH/SOL/XRP/DOGE at 5 Hz. History comes through the **CF Benchmarks REST passthrough** (`/trade-api/v2/cfbenchmarks/...`, which requires an account entitlement **[verify that your account has it]**). Exchange feeds are still useful as *leading* signals, since the index is computed from them, but you do not need to rebuild the settlement index yourself.
 
 ### 1.2 Related Kalshi contracts (needed for the credible-interval and arbitrage ideas)
 
@@ -63,6 +63,7 @@ Kalshi publishes **no number of traders, no unique-account counts, no per-user p
 | WebSocket `orderbook_delta` | Level-by-level book changes (adds and cancels) | Live only. Needs an authenticated connection |
 | WebSocket `market_lifecycle_v2` | Market open, close, determination and settlement events | Live only |
 | RFQ endpoints | Requests for quote, for larger size | Live |
+| WebSocket `cfbenchmarks_value` / `cfbenchmarks_value_5hz` | **Official CF Benchmarks RTI values** (1 Hz for 21 coins, 5 Hz for BTC/ETH/SOL/XRP/DOGE), trailing 60-second average, and the running quarter-hour settlement average in the final minute | Live. History via the REST passthrough (entitlement required) |
 
 **Kalshi-derived features** (computed per market, at several look-backs such as 10s, 30s, 1m and 5m):
 
@@ -77,9 +78,10 @@ Kalshi publishes **no number of traders, no unique-account counts, no per-user p
 
 | Source | Features |
 |---|---|
-| BRTI constituent spot exchanges (Coinbase, Kraken, Bitstamp, Gemini, …) via public WebSockets | 1-second mid/last, a **BRTI proxy** (median across venues of a depth-weighted mid), the running 60-second average, distance to strike in σ units, spot order-book imbalance, trade flow |
+| Kalshi `cfbenchmarks_value(_5hz)` | **The official settlement index**: the running 60-second average, distance to strike in σ units, and 1-second/5 Hz returns for realised volatility |
+| BRTI constituent spot exchanges (Coinbase, Kraken, Bitstamp, Gemini, …) via public WebSockets | *Leading* signals for the index (the index is computed from these books, so their moves arrive slightly earlier), spot order-book imbalance, trade flow, and a fallback index proxy if the Kalshi feed drops |
 | Perpetual futures (Binance, Bybit, OKX, Coinbase International) | Perps lead spot by a few hundred ms to seconds: basis, funding rate, OI changes, **liquidation prints**, perp OFI |
-| CF Benchmarks | Official BRTI history (licensed or delayed), used to **calibrate your proxy's tracking error** |
+| CF Benchmarks via the Kalshi REST passthrough | Official RTI history for backtesting COA 1 (`/cfbenchmarks/history/values`; each call costs 50 read tokens) |
 | Options (Deribit, CME) | DVOL / ATM implied vol, which serves as a **prior for σ**, plus the short-dated skew |
 | Realised volatility | Realised variance from 1-second returns, Parkinson/Garman-Klass estimators, HAR-RV (1-minute/15-minute/1-hour/1-day components), bipower variation (a jump-robust estimator), and jump flags |
 | Calendar | Hour-of-day/day-of-week (volatility seasonality), US equity open/close, macro release times (CPI, FOMC, NFP), weekends, CME gap times |
@@ -119,14 +121,14 @@ Every COA shares a **common base**: a recorder that logs Kalshi WebSocket data (
 
 | Stage | Design |
 |---|---|
-| **Collect** | 1-second trades and order books from the BRTI constituent exchanges; Deribit DVOL; Kalshi 15M `ticker` plus settled labels. Backfill with the Kalshi historical endpoints and exchange trade archives |
-| **Process** | Build a BRTI proxy (median of depth-weighted mids) and calibrate it to official settlement values (`expiration_value`) to estimate the tracking error σ_track. Compute the running 60-second average, the observed fraction of the averaging window, and realised-volatility features (HAR-RV, bipower variation, jump flags) |
+| **Collect** | The official index from Kalshi `cfbenchmarks_value(_5hz)` (history from the REST passthrough), constituent-exchange books as leading signals, Deribit DVOL, Kalshi 15M `ticker` plus settled labels |
+| **Process** | Use the official index directly and check it against `expiration_value` on settled markets. Compute the running 60-second average, the observed fraction of the averaging window, and realised-volatility features (HAR-RV, bipower variation, jump flags) |
 | **Model** | A Bayesian stochastic-volatility model of 1-second log returns with Student-t innovations (in PyMC, NumPyro or Stan), and a HAR prior on σ informed by DVOL. Fit offline, then update the σ posterior online (particle filter, or a conjugate inverse-gamma update on recent realised variance). Use an analytic or Monte Carlo posterior predictive for **A_close = known part + simulated remaining path** |
 | **Predict** | Full posterior of A_close, giving a **credible interval** for the settlement price, and P(YES) = P(A_close ≥ K) with its own credible interval. Trade only when the *entire* credible interval of P sits beyond `market price ± fees` |
 
 - **Strengths:** It needs little Kalshi history, since the physics of an averaged random walk does most of the work. It is interpretable and transfers across assets (BTC/ETH/SOL share the code). It handles the final-60-second partial-observation edge exactly. It gives honest uncertainty that you can use for Kelly sizing.
 - **Weaknesses:** Market makers almost certainly run a similar model, so the edge comes mostly from better σ estimation, a better BRTI proxy and speed. Fat tails and jumps (liquidation cascades) break Gaussian assumptions. It ignores Kalshi order flow.
-- **Assumptions:** Drift ≈ 0 over 15 minutes. The BRTI proxy tracking error is small and stable. Volatility is forecastable over a 1–15 minute horizon. Execution is fast enough to act before the market reprices.
+- **Assumptions:** Drift ≈ 0 over 15 minutes. Kalshi's index feed is reliable and timely, with the exchange-built proxy only as a fallback. Volatility is forecastable over a 1–15 minute horizon. Execution is fast enough to act before the market reprices.
 
 ---
 
@@ -209,6 +211,8 @@ Every COA shares a **common base**: a recorder that logs Kalshi WebSocket data (
 3. **Weeks 3–6:** build **COA 4** on top of COA 1's distribution. It is the least crowded edge, and it uses the range-bracket/credible-interval framing directly.
 4. **Weeks 6+:** use **COA 3** to combine sources and, once enough book data has accumulated, add **COA 2** features. Treat **COA 5** as an execution layer, not a standalone strategy, unless you are prepared to compete on latency.
 
+> **Superseded:** the selected path is COAs 1 + 2 + 4 on a ~6-week schedule. See Part 6 and the [full design](../design/02-system-design-coa-1-2-4.md).
+
 ### Evaluation rules that apply to every COA
 
 - Validate walk-forward by day, with no shuffling and a gap (purging) between train and test.
@@ -218,12 +222,49 @@ Every COA shares a **common base**: a recorder that logs Kalshi WebSocket data (
 
 ---
 
+## Part 6: Selected path, COAs 1 + 2 + 4 as one system
+
+The three COAs are layers of one system, not three separate projects:
+
+```
+Shared recorder (Kalshi WebSocket + exchange spot/futures + hourly ladder snapshots)
+        │
+        ├── COA 1: structural model → price interval for the closing average, P_struct(YES)
+        │        │
+        │        ├── COA 4: compares COA 1's distribution with the hourly/range ladder
+        │        │          and with the other assets → relative-value trades
+        │        │
+        │        └── COA 2: order-flow model fit on what COA 1 gets wrong
+        │                   (COA 1's P is a fixed input; flow features only adjust it)
+        ▼
+   Final P(YES), edge after fees, position sizing
+```
+
+- **COA 1 is the base layer.** COA 4 needs a price distribution to compare against the ladder, and COA 1 produces it. COA 2 works best as a *correction* on COA 1, not as a standalone direction model. With only about 96 windows a day per asset, learning COA 1's mistakes needs far less data than learning direction from scratch.
+- **COA 2's slow part is the order-book history,** which you have to record yourself. To fit the schedule, COA 2 ships in two versions. **v1** uses only features rebuilt from Kalshi's *historical* trade tape and 1-minute candles, which can be backfilled on day 1. **v2** adds order-book features once about 4 weeks of recorded book data exist. v2 arrives *after* go-live.
+- **COA 4 diversifies the other two.** COAs 1 and 2 both make directional bets on the 15-minute markets. COA 4's ladder and cross-asset trades carry much less directional risk.
+- **What we keep from COA 3:** feeding COA 1's P into COA 2 as a fixed input, with a prior centred on "flow adds nothing", does the combining.
+- **What we keep from COA 5:** a basic execution layer (choosing maker vs taker, timing entries with COA 2's 30-second price-move signal). No speed race; we avoid strategies that depend on picking off stale quotes.
+
+**New risks from running all three**
+- **One common weak point:** all three depend on the index feed. Kalshi's `cfbenchmarks_value` stream is the primary source. Each window's value is checked against `expiration_value`, and trading stops automatically if the feed goes stale or disagrees with settlement.
+- **Overlapping positions:** on windows that close on the hour, COA 1 and COA 4 can trade the same contract. One shared position-and-risk book nets them.
+- **COA 2 has to earn its place:** it is compared against COA 1 alone on out-of-sample log loss and on P&L after fees. If flow doesn't improve things, it is dropped.
+
+**Compressed schedule (about 6 weeks to small-size live trading):** week 1 recorder + backfill + index history, week 2 COA 1, week 3 COA 1 shadow trading + COA 4 no-arbitrage scanner, week 4 COA 4 models + COA 2 v1, week 5 combined shadow trading + risk controls, week 6 go/no-go and live at small size. COA 2 v2 comes in weeks 8–10. Details, data volumes and the live-capture architecture are in the [system design](../design/02-system-design-coa-1-2-4.md).
+
+---
+
 ## Sources
 
 - Kalshi API docs index: https://docs.kalshi.com/llms.txt
 - Kalshi Get Market (Market object fields): https://docs.kalshi.com/api-reference/market/get-market
 - Kalshi WebSocket market ticker channel: https://docs.kalshi.com/websockets/market-ticker.md
 - Kalshi WebSocket connection / channels: https://docs.kalshi.com/getting_started/quick_start_websockets
+- Kalshi CF Benchmarks value feed (official index over WebSocket): https://docs.kalshi.com/websockets/cfbenchmarks-value , 5 Hz: https://docs.kalshi.com/websockets/cfbenchmarks-value-5hz
+- Kalshi CF Benchmarks REST passthrough (index history): https://docs.kalshi.com/cfbenchmarks/rest-passthrough
+- Kalshi order-book updates channel: https://docs.kalshi.com/websockets/orderbook-updates.md
+- Kalshi rate limits: https://docs.kalshi.com/getting_started/rate_limits
 - Kalshi Help Center, crypto markets (60-second CF RTI average): https://help.kalshi.com/en/articles/13823838-crypto-markets
 - CFTC filing, Kalshi bitcoin contract amendment to a 60-second average: https://cftc.gov/filings/orgrules/rules1112248605.pdf
 - KXBTC15M rules text mirror: https://exchange.pmxt.dev/markets/kxbtc15m/bitcoin-price-abovebelow/kxbtc15m-26sep021900-00
