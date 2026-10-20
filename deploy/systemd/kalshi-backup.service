@@ -1,0 +1,10 @@
+[Unit]
+Description=Copy the last 14 days of Kalshi raw data to free off-site storage (rclone)
+
+[Service]
+Type=oneshot
+User=kalshi
+# Copy closed files from the last 14 days, then drop remote files older than 14 days so
+# the bucket stays inside the free 10 GB tier.
+ExecStart=/usr/bin/rclone copy /var/lib/kalshi/raw offsite:kalshi-raw/raw --max-age 14d --exclude "*.part" --config /etc/kalshi/rclone.conf
+ExecStartPost=/usr/bin/rclone delete offsite:kalshi-raw/raw --min-age 14d --config /etc/kalshi/rclone.conf

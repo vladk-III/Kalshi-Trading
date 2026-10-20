@@ -1,0 +1,24 @@
+[Unit]
+Description=Kalshi market data recorder
+Wants=network-online.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=simple
+User=kalshi
+Group=kalshi
+EnvironmentFile=/etc/kalshi/recorder.env
+WorkingDirectory=/opt/kalshi-trading
+ExecStart=/opt/kalshi-trading/.venv/bin/kalshi-recorder --config /opt/kalshi-trading/configs/recorder.yaml
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+MemoryMax=2G
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/kalshi
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=Delete oldest Kalshi raw files when disk runs low
+
+[Service]
+Type=oneshot
+User=kalshi
+ExecStart=/opt/kalshi-trading/.venv/bin/kalshi-retention --root /var/lib/kalshi/raw --keep-days 300 --min-free-gb 20

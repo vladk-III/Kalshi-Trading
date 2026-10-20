@@ -13,7 +13,8 @@
   1. Kalshi streams the official settlement index (`cfbenchmarks_value`, `cfbenchmarks_value_5hz`) and serves its history through a REST passthrough, so there is **no index rebuild or licence work**.
   2. About 9 months of settled 15-minute markets, trades and 1-minute candles can be **backfilled on day 1**.
   3. The one dataset that can't be backfilled (order-book history) feeds only COA 2 v2, which ships after launch.
-- **Data size:** about **0.5–2 GB/day compressed** (15–60 GB/month) for the recommended capture set. That is "a ton of messages" but small on disk. The hard part is **reliability** (no silent gaps), not volume. See §3.
+- **Data size:** about **0.5–2 GB/day compressed** (15–60 GB/month) for the full capture set, and about **0.2–0.6 GB/day** for the Kalshi-only v1 capture set used by the $0 profile. That is "a ton of messages" but small on disk. The hard part is **reliability** (no silent gaps), not volume. See §3.
+- **Cost: $0.** One Oracle Cloud Always Free VM runs everything, there is no secondary host, and free tiers cover alerts and an optional 14-day off-site copy (§3.6). The only money involved is trading capital and trading fees.
 
 ---
 
@@ -33,14 +34,14 @@ Assets: start with **BTC, ETH, SOL and XRP**, which all have 15-minute series an
 ## 2. Architecture
 
 ```
-                          ┌────────────────────────────── Host A (primary, US-East) ──────────────────────────────┐
+                          ┌──────────────── Oracle Always Free VM (US East / Ashburn), the only host ──────────────┐
  Kalshi WebSocket ──────► │ kalshi-recorder ──┐                                                                     │
   ticker, trade,          │  (market data +   │   raw envelopes        ┌───────────────┐   hourly   ┌────────────┐  │
-  orderbook_delta,        │   index feeds)    ├──────────────────────► │ raw log writer│──────────► │ uploader + │──┼──► Object storage
-  market_lifecycle_v2,    │                   │                        │ (.ndjson.zst) │            │ compactor  │  │    (S3 / R2 / B2)
+  orderbook_delta,        │   index feeds)    ├──────────────────────► │ raw log writer│──────────► │ rclone +   │──┼──► Object storage
+  market_lifecycle_v2,    │                   │                        │ (.ndjson.zst) │            │ compactor  │  │    (free R2/B2, 14 days)
   cfbenchmarks_value(5hz) │ exchange-recorder ┤                        └───────────────┘            │ → Parquet  │  │
- Coinbase / Kraken WS ──► │  (lead signals)   │                                                     └────────────┘  │
-                          │                   │  parsed events (ZeroMQ PUB, IPC)                                     │
+ Coinbase / Kraken WS ──► │  (lead signals,   │                                                     └────────────┘  │
+                          │   off in v1)      │  parsed events (ZeroMQ PUB, IPC)                                     │
  Market registry (REST) ─►│ registry ─────────┘          │                                                         │
   GET /markets polling    │                              ▼                                                         │
                           │                    ┌──────────────────┐   ┌────────────┐   ┌──────────┐   ┌──────────┐ │
@@ -49,9 +50,9 @@ Assets: start with **BTC, ETH, SOL and XRP**, which all have 15-minute series an
                           │                    │  in replay)      │   └────────────┘   └──────────┘   └────┬─────┘ │
                           │                    └──────────────────┘                                        │       │
                           │  private WS: fill, market_positions ◄─────────────────────────────────────────┘       │
-                          │  metrics → Prometheus/Grafana, alerts → phone                                          │
+                          │  events stream (stats, gaps, errors) → ntfy push alerts to phone                       │
                           └────────────────────────────────────────────────────────────────────────────────────────┘
-                          Host B (secondary, different provider): recorders only, used to fill Host A's gaps
+                          No secondary host ($0 profile): downtime shows up as logged gaps
 ```
 
 **Design rules**
@@ -80,7 +81,8 @@ These are estimates. **Instrument byte and message counters on day 1 and replace
 | Perp/funding/liquidations (optional) | A venue you may legally access (see §3.5) | trades, top of book, funding, liquidations | 20–200 | 0.5–4 GB | 50–400 MB |
 | **Total (recommended)** | | | **~200–600 avg** | **~7–17 GB** | **~0.7–1.7 GB** |
 
-- **Per month:** about **20–50 GB** compressed, which costs **under $5/month** in object storage (R2/B2/S3).
+- **$0 profile (what v1 records):** only the Kalshi rows (index, 15M markets, hourly ladders), about **0.2–0.6 GB/day compressed**. The VM's 200 GB disk holds about a year. Exchange trades and books stay **off** until COA 1's `lead_gap` term is worked on. They are a config change away and add about 0.5 GB/day.
+- **Per month (full set):** about **20–50 GB** compressed.
 - **If you instead store full L2 delta streams for the exchanges:** add 10–50 GB/day raw (1–5 GB compressed). This isn't needed for v1, because the official index comes from Kalshi and exchange books are only lead signals. Keep a **7-day rolling buffer** of full exchange L2 for BTC if you want to explore later.
 - **Throughput:** a few hundred to a few thousand messages per second is light work. One Python asyncio process per venue using `orjson` handles well over 10k msg/s per core. A 2-vCPU/4 GB VM is enough for recording plus the strategy.
 
@@ -119,11 +121,11 @@ These are estimates. **Instrument byte and message counters on day 1 and replace
 **Writing**
 - Envelope per message: `{"rt": <recv_ts_ns>, "h": <host>, "c": <conn_id>, "v": "kalshi", "raw": <original bytes as string>}`.
 - Envelopes are appended to `raw/kalshi/<conn>/<YYYY-MM-DD>/<HH>.ndjson.zst` using a streaming zstd writer, flushed every 1 s and rotated hourly.
-- An **uploader** pushes closed hours to object storage. A **compactor** parses them into typed Parquet tables partitioned by `date/asset/table`: `index_tick`, `kalshi_ticker`, `kalshi_trade`, `kalshi_book_snapshot`, `kalshi_book_delta`, `kalshi_lifecycle`, `market_meta`, `ex_trade`, `ex_book_snap`, `gaps`.
-- Local disk keeps 7 days (about 15 GB), and object storage keeps everything.
+- A **compactor** (next to build) parses them into typed Parquet tables partitioned by `date/asset/table`: `index_tick`, `kalshi_ticker`, `kalshi_trade`, `kalshi_book_snapshot`, `kalshi_book_delta`, `kalshi_lifecycle`, `market_meta`, `ex_trade`, `ex_book_snap`, `gaps`.
+- **Storage ($0 profile):** the VM disk is the primary store, and a daily retention job deletes the oldest files only when free space drops below 20 GB. An optional hourly `rclone` job copies the **last 14 days** to a free 10 GB R2/B2 bucket and prunes older remote files.
 
-**Redundancy**
-- Host B runs the same recorders on a different provider. The compactor uses Host A's data and fills Host A's `gaps` intervals from Host B, deduplicating on `trade_id` for trades and re-seeding books from B's snapshots for book streams.
+**Redundancy ($0 profile)**
+- There is no second host. Recorder crashes are covered by systemd restarting the process within 5 s. VM or network outages show up as `disconnected`/`connected` events in the `events` stream. The compactor turns these into `gaps` rows, and backtests exclude or flag the affected windows. Data you can re-download (trades, candles, settled markets, index history) is refilled by the backfill job. **Order-book history lost during an outage is gone for good**, and that is the accepted cost of $0.
 
 **Clocks and latency**
 - `chrony` with good NTP servers on both hosts, alerting at more than 50 ms offset.
@@ -141,13 +143,24 @@ Binance, Bybit and OKX restrict US persons, and some also block US IPs from thei
 
 ### 3.6 Hosting and cost
 
-| Item | Choice | Est. $/month |
+**$0 profile (selected).** Step-by-step setup: [deploy/ORACLE_FREE_SETUP.md](../../deploy/ORACLE_FREE_SETUP.md).
+
+| Item | Choice | $/month |
 |---|---|---|
-| Host A | 2–4 vCPU / 8 GB VM in **US-East** (Kalshi's location **[verify]**; AWS `us-east-1` is a reasonable default) | 30–80 |
-| Host B | Small VM, different provider | 10–25 |
-| Object storage | Cloudflare R2 / Backblaze B2 / S3, about 50 GB/month growth | 1–5 |
-| Monitoring | Self-hosted Prometheus + Grafana on Host A, alerts via ntfy/Telegram | 0 |
-| **Total** | | **~$45–110** |
+| The only host | **Oracle Cloud Always Free** `VM.Standard.A1.Flex` ARM VM, 2 OCPU / 12 GB (of the 4 / 24 GB free allowance), **200 GB** boot volume, home region **US East (Ashburn)** | 0 |
+| Off-site copy (optional) | Cloudflare R2 or Backblaze B2 free 10 GB, rolling last 14 days via `rclone` | 0 |
+| Alerts | ntfy push notifications (free) from the recorder's `events` | 0 |
+| Monitoring | `stats` events every 60 s in the events stream, plus `journalctl` | 0 |
+| Code, CI | GitHub private repo + free Actions minutes (CI only, never for running the bot) | 0 |
+| **Total** | | **$0** |
+
+**Free-tier risks:**
+- **Idle reclamation:** Oracle may reclaim Always Free VMs that look idle **[verify the current policy]**. The mitigation is upgrading to Pay As You Go (Always Free resources stay free) with a $1 budget alert.
+- **Capacity:** free ARM capacity can be unavailable at signup, so you may need to retry.
+- **No redundancy:** see §3.3.
+- **Disk:** 200 GB is about a year of Kalshi-only data.
+
+*Paid upgrade path, if ever wanted:* a second recorder host on another provider (about $10–25/month) to fill gaps, plus storage for the full archive off-site (under $5/month).
 
 ---
 
@@ -323,7 +336,7 @@ All kill switches are **tested in shadow mode** by injecting faults (dropping th
 
 | Week | Deliverables | Exit check |
 |---|---|---|
-| **1: Data** | API keys (separate recording and trading keys); confirm the CF passthrough entitlement; **recorder live by day 2** (Kalshi market data + index + Coinbase/Kraken); registry; raw writer + uploader; backfill jobs started (settled markets, trades, candles, index history); compactor → Parquet; Prometheus metrics + alerts | 48 h of clean recording; backfill at least 50% complete; settlement unit test passes |
+| **1: Data** | Oracle free VM up; API keys (separate recording and trading keys); confirm the CF passthrough entitlement; **recorder live by day 2** (Kalshi market data + index; **built**, see `kalshi_trading/`); backfill jobs started (settled markets, trades, candles, index history); compactor → Parquet; ntfy alerts | 48 h of clean recording; backfill at least 50% complete; settlement unit test passes |
 | **2: COA 1** | Shared definitions (§4); realised-volatility and HAR features; NumPyro HAR fit; online inverse-gamma update; Monte Carlo predictive; replay backtester (taker fill model); calibration report | Calibration gates met on backfill |
 | **3: Shadow + COA 4a** | COA 1 running live in shadow; decision layer + sizing; no-arbitrage scanner live (logging only); isotonic ladder fit; risk module skeleton | Shadow running 24/7; scanner logs violations with fee-adjusted P&L |
 | **4: COA 4b + COA 2 v1** | 15M-vs-ladder and COA 1-vs-ladder signals; COA 2 v1 features from backfilled trades/candles; NumPyro correction model + LightGBM challenger; keep-or-drop test; lead-gap λ fit (2 weeks of exchange data now exist) | Keep-or-drop decision recorded; COA 4 signals in shadow |
@@ -343,7 +356,7 @@ This schedule assumes **one full-time developer**. With two, split recorder/exec
 kalshi_trading/
   common/        config, time utilities, Kalshi auth (RSA-PSS signing), event schemas
   collectors/    kalshi_ws.py, registry.py, exchange_coinbase.py, exchange_kraken.py, backfill/
-  storage/       raw_writer.py, uploader.py, compactor.py, parquet_schemas.py
+  storage/       raw_writer.py, raw_reader.py, retention.py, compactor.py, parquet_schemas.py
   features/      index_features.py (RV, HAR inputs, lead_gap), kalshi_flow.py, ladder.py, books.py
   models/        coa1_structural.py, coa2_correction.py, coa4_ladder.py, calibration.py
   strategy/      decision.py, sizing.py, risk.py, position_book.py
@@ -359,7 +372,7 @@ docs/
 **Stack:**
 - Python 3.12; `asyncio` + `websockets`; `orjson`; `zstandard`; `pyarrow` + `polars`; DuckDB for ad-hoc queries.
 - NumPyro/JAX for the Bayesian models; NumPy/SciPy; LightGBM (challenger).
-- `cryptography` (RSA-PSS); `pyzmq` (live event bus); `prometheus-client`.
+- `cryptography` (RSA-PSS); `pyzmq` (live event bus); `httpx` (REST + ntfy alerts).
 - systemd or Docker Compose on the VMs.
 
 ---

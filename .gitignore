@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+# Never commit credentials or recorded data
+*.pem
+*.key
+.env
+data/
